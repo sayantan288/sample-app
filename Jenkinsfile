@@ -1,79 +1,87 @@
-currentBuild.displayName = "Final_Demo # "+currentBuild.number
+pipeline {
+    // ① Select a Jenkins slave with Docker capabilities
+    agent {
+        label 'docker'
+    }
 
-   def getDockerTag(){
-        def tag = sh script: 'git rev-parse HEAD', returnStdout: true
-        return tag
-        }
-        
+    environment {
+        PRODUCT = 'ghcli'
+        GIT_HOST = 'somewhere'
+        GIT_REPO = 'repo'
+    }
 
-pipeline{
-        agent any  
-        environment{
-	    Docker_tag = getDockerTag()
-        }
-        
-        stages{
+    options {
+        ansiColor('xterm')
+        skipDefaultCheckout()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
 
-
-              stage('Quality Gate Statuc Check'){
-
-               agent {
-                docker {
-                image 'maven'
-                args '-v $HOME/.m2:/root/.m2'
+    stages {
+        // ② Checkout the right branch
+        stage('Checkout') {
+            steps {
+                script {
+                    BRANCH_NAME = env.CHANGE_BRANCH ? env.CHANGE_BRANCH : env.BRANCH_NAME
+                    deleteDir()
+                    git url: "git@<host>:<org>/${env.PRODUCT}.git", branch: BRANCH_NAME
                 }
             }
-                  steps{
-                      script{
-                      withSonarQubeEnv('sonarserver') { 
-                      sh "mvn sonar:sonar"
-                       }
-                      timeout(time: 1, unit: 'HOURS') {
-                      def qg = waitForQualityGate()
-                      if (qg.status != 'OK') {
-                           error "Pipeline aborted due to quality gate failure: ${qg.status}"
-                      }
+        }
+
+	// ③ Build a container with the code source of the application
+        stage('Build') {
+            steps {
+                sh "docker build . -t ${env.PRODUCT}:py"
+            }
+        }
+
+	// ④ Run the test using the built docker image
+        stage('Test') {
+            steps {
+                script {
+                    sh "docker run --tty --name ${env.PRODUCT} ${env.PRODUCT}:py /usr/bin/make test"
+                }
+            }
+        }
+
+    	// ⑤ Analyse code quality using previous container as a Docker Container Volume
+        stage('Quality') {
+            steps {
+                withCredentials([string(credentialsId: '<credentialsId>', variable: 'SONAR_LOGIN')]) {
+                    script {
+			// ⑥ Compute some arguments depending we are on main, branch or pull request.
+                        if (env.CHANGE_ID) {
+                            options = "-Dsonar.pullrequest.branch=${env.CHANGE_BRANCH} "
+                            options += " -Dsonar.pullrequest.key=${env.CHANGE_ID} "
+                            options += " -Dsonar.pullrequest.base=${env.CHANGE_TARGET}"
+                        } else if (BRANCH_NAME == 'main') {
+                            options = ''
+                        } else {
+                            options = "-Dsonar.branch.name=${BRANCH_NAME}"
+                        }
+
+			// ⑦ Mount the previous Docker Container as a Volume
+		    	// to Sonar container to analyse the code
+                        sh "docker run \
+                            --rm \
+                            -e SONAR_HOST_URL=https://<sonarHost> \
+                            -e SONAR_LOGIN=${SONAR_LOGIN} \
+                            --volumes-from ${env.PRODUCT} \
+                            sonarsource/sonar-scanner-cli \
+                            sonar-scanner ${options}"
                     }
-		    sh "mvn clean install"
-                  }
-                }  
-              }
+                }
+            }
+        }
+    }
 
-
-
-              stage('build')
-                {
-              steps{
-                  script{
-		 sh 'cp -r ../devops-training@2/target .'
-                   sh 'docker build . -t deekshithsn/devops-training:$Docker_tag'
-		   withCredentials([string(credentialsId: 'docker_password', variable: 'docker_password')]) {
-				    
-				  sh 'docker login -u deekshithsn -p $docker_password'
-				  sh 'docker push deekshithsn/devops-training:$Docker_tag'
-			}
-                       }
-                    }
-                 }
-		 
-		stage('ansible playbook'){
-			steps{
-			 	script{
-				    sh '''final_tag=$(echo $Docker_tag | tr -d ' ')
-				     echo ${final_tag}test
-				     sed -i "s/docker_tag/$final_tag/g"  deployment.yaml
-				     '''
-				    ansiblePlaybook become: true, installation: 'ansible', inventory: 'hosts', playbook: 'ansible.yaml'
-				}
-			}
-		}
-		
-	
-		
-               }
-	       
-	       
-	       
-	      
-    
+	// ⑧ Cleanup
+    post {
+        always {
+            script {
+                sh "docker rm ${env.PRODUCT}"
+            }
+            deleteDir()
+        }
+    }
 }
